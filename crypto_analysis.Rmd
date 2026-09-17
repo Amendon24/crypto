@@ -1,0 +1,289 @@
+---
+title: "Cryptocurrency Volatility Analysis (2022-2026)"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 2
+    keep_md: true
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                       fig.width = 7, fig.height = 4.5, cache = FALSE)
+```
+
+```{r packages}
+library(tidyverse)
+library(janitor)
+library(skimr)
+library(lubridate)
+library(broom)
+library(car)
+library(ggpubr)
+library(here)
+
+set.seed(42)
+```
+
+```{r session-info-early}
+Sys.time()
+R.version.string
+```
+
+# Load raw data
+
+```{r load-raw}
+raw_path <- here("crypto50_combined.csv")
+
+crypto_raw <- read_csv(raw_path, show_col_types = FALSE) %>%
+  clean_names()  # -> symbol, date, open, high, low, close, adj_close, volume
+
+glimpse(crypto_raw)
+names(crypto_raw)
+```
+
+```{r provenance-log}
+n_rows_raw     <- nrow(crypto_raw)
+date_range_raw <- range(crypto_raw$date, na.rm = TRUE)
+
+cat("Raw row count:", n_rows_raw, "\n")
+cat("Raw date range:", as.character(date_range_raw[1]), "to",
+    as.character(date_range_raw[2]), "\n")
+cat("Distinct symbols:", n_distinct(crypto_raw$symbol), "\n")
+cat("Checksum (md5) of raw file:", tools::md5sum(raw_path), "\n")
+```
+
+# Scope to 2022-01-01 onward (pre-2022 panel is inconsistent/non-stationary)
+
+```{r scope-filter}
+crypto <- crypto_raw %>%
+  filter(date >= as.Date("2022-01-01"))
+
+n_rows_scoped <- nrow(crypto)
+
+cat("Scoped row count (2022-01-01 onward):", n_rows_scoped, "\n")
+cat("Rows dropped by scoping:", n_rows_raw - n_rows_scoped,
+    sprintf("(%.1f%% of raw)", 100 * (n_rows_raw - n_rows_scoped) / n_rows_raw), "\n")
+```
+
+# Clean
+
+```{r cleaning-types}
+crypto <- crypto %>%
+  mutate(symbol = as.factor(symbol),
+         date   = as.Date(date)) %>%
+  arrange(symbol, date)
+
+skim(crypto)
+```
+
+```{r adj-close-check}
+# crypto has no splits/dividends -> adj_close should == close; drop if identical
+if ("adj_close" %in% names(crypto)) {
+  n_diff <- sum(abs(crypto$adj_close - crypto$close) > 1e-6, na.rm = TRUE)
+  cat("Rows where adj_close differs from close:", n_diff, "out of", nrow(crypto), "\n")
+
+  if (n_diff == 0) {
+    crypto <- crypto %>% select(-adj_close)
+    cat("adj_close == close for all rows -> dropped.\n")
+  } else {
+    cat("adj_close differs in some rows -> keeping both, investigate.\n")
+  }
+}
+```
+
+```{r missingness}
+crypto %>%
+  summarise(across(everything(), ~ sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "n_missing") %>%
+  filter(n_missing > 0)
+```
+
+```{r market-cap-check}
+# no native market_cap column in this file -> proxy with close * volume
+if (!"market_cap" %in% names(crypto)) {
+  warning("No market_cap column found — using close * volume as proxy (not true market cap).")
+  crypto <- crypto %>% mutate(market_cap = close * volume)
+}
+```
+
+```{r outlier-check}
+crypto %>%
+  arrange(desc(market_cap)) %>%
+  select(symbol, date, market_cap) %>%
+  head(10)
+```
+
+```{r zero-price-check}
+# close == 0 (or a lagged close == 0) makes log_return / daily_range blow up
+# to -Inf/Inf/NaN downstream, which then poisons cor(), t.test(), and lm().
+n_zero_close <- sum(crypto$close <= 0, na.rm = TRUE)
+n_zero_hl    <- sum(crypto$high <= 0 | crypto$low <= 0, na.rm = TRUE)
+
+cat("Rows with close <= 0:", n_zero_close, "\n")
+cat("Rows with high <= 0 or low <= 0:", n_zero_hl, "\n")
+
+crypto <- crypto %>%
+  filter(close > 0, open > 0, high > 0, low > 0)
+
+cat("Rows remaining after non-positive price filter:", nrow(crypto), "\n")
+```
+
+```{r derived-variables}
+crypto <- crypto %>%
+  group_by(symbol) %>%
+  arrange(date, .by_group = TRUE) %>%
+  mutate(
+    log_return  = log(close / lag(close)),
+    daily_range = (high - low) / close,
+    log_volume  = log1p(volume),
+    log_mcap    = log1p(market_cap)
+  ) %>%
+  ungroup() %>%
+  filter(!is.na(log_return))
+
+n_before_finite <- nrow(crypto)
+
+# drop any remaining non-finite log_return / daily_range (e.g. lag(close) == 0
+# at a tier boundary) rather than letting Inf/NaN propagate silently
+crypto <- crypto %>%
+  filter(is.finite(log_return), is.finite(daily_range))
+
+cat("Rows dropped for non-finite log_return/daily_range:",
+    n_before_finite - nrow(crypto), "\n")
+cat("Rows remaining:", nrow(crypto), "\n")
+
+summary(select(crypto, log_return, daily_range, log_volume, log_mcap))
+```
+
+```{r cap-tiers}
+tier_lookup <- crypto %>%
+  group_by(symbol) %>%
+  summarise(mean_log_mcap = mean(log_mcap, na.rm = TRUE), .groups = "drop") %>%
+  arrange(desc(mean_log_mcap)) %>%
+  mutate(cap_tier = if_else(row_number() <= 5, "Top 5", "Rest"))
+
+crypto <- crypto %>%
+  left_join(tier_lookup %>% select(symbol, cap_tier), by = "symbol") %>%
+  mutate(cap_tier = factor(cap_tier, levels = c("Top 5", "Rest")))
+
+table(crypto$cap_tier)
+tier_lookup
+```
+
+# EDA
+
+```{r eda-descriptives}
+crypto %>%
+  group_by(cap_tier) %>%
+  summarise(
+    n           = n(),
+    mean_return = mean(log_return, na.rm = TRUE),
+    sd_return   = sd(log_return, na.rm = TRUE),
+    mean_range  = mean(daily_range, na.rm = TRUE),
+    sd_range    = sd(daily_range, na.rm = TRUE)
+  )
+```
+
+```{r eda-return-distribution}
+ggplot(crypto, aes(x = log_return, fill = cap_tier)) +
+  geom_histogram(alpha = 0.6, position = "identity", bins = 60) +
+  labs(title = "Distribution of Daily Log Returns by Cap Tier",
+       x = "Daily log return", y = "Count", fill = "Cap tier") +
+  theme_minimal()
+```
+
+```{r eda-volatility-boxplot}
+ggplot(crypto, aes(x = cap_tier, y = daily_range, fill = cap_tier)) +
+  geom_boxplot(outlier.alpha = 0.3) +
+  labs(title = "Daily Price Range (Volatility Proxy) by Cap Tier",
+       x = NULL, y = "Daily range = (High - Low) / Close") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+```{r eda-correlation}
+crypto %>%
+  select(log_return, daily_range, log_volume, log_mcap) %>%
+  cor(use = "pairwise.complete.obs") %>%
+  round(2)
+```
+
+```{r eda-timeseries}
+crypto %>%
+  filter(symbol %in% c("BTC", "ETH")) %>%
+  ggplot(aes(x = date, y = close, colour = symbol)) +
+  geom_line() +
+  scale_y_log10() +
+  labs(title = "BTC vs ETH Closing Price, 2022-2026 (log scale)",
+       x = NULL, y = "Close (log scale)", colour = "Symbol") +
+  theme_minimal()
+```
+
+# Assumption checks
+
+```{r assumption-normality}
+shapiro_sample <- crypto %>%
+  slice_sample(n = min(5000, nrow(crypto)))  # Shapiro-Wilk caps at 5000 obs
+
+shapiro.test(shapiro_sample$daily_range)
+shapiro.test(shapiro_sample$log_return)
+```
+
+```{r assumption-variance}
+leveneTest(daily_range ~ cap_tier, data = crypto)
+```
+
+# Inferential analysis
+
+## Cap-tier comparison
+
+```{r test-primary-parametric}
+t.test(daily_range ~ cap_tier, data = crypto)
+```
+
+```{r test-primary-nonparametric}
+wilcox.test(daily_range ~ cap_tier, data = crypto)
+```
+
+```{r test-primary-plot}
+ggboxplot(crypto, x = "cap_tier", y = "daily_range", fill = "cap_tier") +
+  stat_compare_means(method = "wilcox.test") +
+  labs(title = "Volatility by Cap Tier with Test Result", x = NULL, y = "Daily range") +
+  theme(legend.position = "none")
+```
+
+## Regression: does volume / market cap predict volatility?
+
+```{r model-regression}
+model_vol <- lm(daily_range ~ log_volume + log_mcap, data = crypto)
+summary(model_vol)
+tidy(model_vol, conf.int = TRUE)
+```
+
+```{r model-diagnostics}
+par(mfrow = c(2, 2))
+plot(model_vol)
+par(mfrow = c(1, 1))
+
+car::vif(model_vol)
+```
+
+# Sensitivity: 2022 bear market vs 2023-2026 recovery
+
+```{r sensitivity-period-split}
+crypto <- crypto %>%
+  mutate(period = if_else(date < as.Date("2023-01-01"), "2022 (bear)", "2023-2026 (recovery)"))
+
+wilcox.test(daily_range ~ period, data = crypto)
+
+crypto %>%
+  group_by(period) %>%
+  summarise(mean_range = mean(daily_range), sd_range = sd(daily_range))
+```
+
+
